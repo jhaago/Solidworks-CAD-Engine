@@ -1,0 +1,24 @@
+<Project>
+  <!-- Smart App Control judges every unsigned binary by its hash and sometimes blocks a fresh build (CodeIntegrity
+       event 3077, policy 0283ac0f-...). Non-deterministic non-Release builds get a new hash on every rebuild, so simply
+       rebuilding gets a new verdict. (Set here, not in .props: Configuration isn't defined yet when .props is read.) -->
+  <PropertyGroup>
+    <Deterministic Condition="'$(Configuration)' != 'Release'">false</Deterministic>
+  </PropertyGroup>
+
+  <!-- ModelContextProtocol.Core ships an analyzer (XML-doc -> [Description] source generator). Application Control /
+       Smart App Control blocks it on some machines (warning CS8034), which also makes tool descriptions machine-dependent.
+       Every tool uses explicit [Description] attributes, so remove it everywhere (ExcludeAssets does not work here). -->
+  <Target Name="DropMcpSdkAnalyzer" BeforeTargets="CoreCompile">
+    <ItemGroup>
+      <Analyzer Remove="@(Analyzer)" Condition="'%(Filename)' == 'ModelContextProtocol.Analyzers'" />
+    </ItemGroup>
+  </Target>
+
+  <!-- One clear error instead of hundreds of CS0246 when SOLIDWORKS (and its interop assemblies) can't be found. -->
+  <Target Name="CheckSolidWorksInterop" BeforeTargets="ResolveAssemblyReferences"
+          Condition="'@(Reference->WithMetadataValue('EmbedInteropTypes','true'))' != ''">
+    <Error Condition="!Exists('$(SolidWorksInteropDir)SolidWorks.Interop.sldworks.dll')"
+           Text="SOLIDWORKS interop assemblies not found in '$(SolidWorksInteropDir)'. Install SOLIDWORKS, or pass -p:SolidWorksDir=... (or set SOLIDWORKS_DIR) to the folder that contains api\redist." />
+  </Target>
+</Project>

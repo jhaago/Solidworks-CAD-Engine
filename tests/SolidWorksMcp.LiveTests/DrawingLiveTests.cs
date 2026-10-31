@@ -1,0 +1,715 @@
+using System.Globalization;
+using SolidWorksMcp.Core;
+using SolidWorksMcp.Core.Model;
+using SolidWorksMcp.Core.Services;
+using Xunit;
+
+namespace SolidWorksMcp.LiveTests;
+
+/// <summary>
+/// The drawing tools (doc_new type=drawing, drw_*) against a live SOLIDWORKS (skipped without SWMCP_LIVE_TESTS=1). Oracle:
+/// a 100 (x) × 60 (y) × 20 (z) block on the front plane, centred on the origin in x and y (z from 0 to 20), whose width
+/// and height are driving sketch dimensions, optionally with a Ø20 hole through its centre, saved under a test folder
+/// (views need a saved model). Its front view is 100:60 at the view scale, the top view 100:20, the right view 20:60.
+/// Every tool has a positive test and negative ones (typed errors, nothing left behind). Drawings are closed before the
+/// parts they show.
+/// </summary>
+public class DrawingLiveTests(LiveFixture fx) : LiveTest(fx)
+{
+    private const double L = 1e-3; // mm: sheet positions and model lengths read back
+    private readonly string _dir = Path.Combine(Path.GetTempPath(), $"swmcp_drawing_{Guid.NewGuid():N}");
+    private readonly List<string> _drawings = [];
+
+    private DrawingService Drw => new(S);
+    private DocumentService Docs => new(S);
+    private SketchService Sk => new(S);
+    private SketchEditService Ed => new(S);
+    private FeatureService Fs => new(S);
+
+    public override async ValueTask InitializeAsync()
+    {
+        await base.InitializeAsync();
+        Directory.CreateDirectory(_dir);
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        if (LiveFixture.Enabled)
+        {
+            // Drawings first: a part a drawing still shows stays loaded behind it.
+            foreach (var h in _drawings)
+            {
+                try { await Docs.CloseAsync(h, save: false, discard: true); }
+                catch (SwException) { /* closed by the test */ }
+            }
+        }
+        try { await base.DisposeAsync(); }
+        finally
+        {
+            try { if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { /* best effort */ }
+        }
+    }
+
+    // ------------------------------------------------------------------ fixtures
+
+    /// <summary>The oracle block (see the class summary), saved as &lt;name&gt;.sldprt in the test folder: (handle, file).</summary>
+    private async Task<(string Doc, string Path)> BlockAsync(string name, bool hole = false, bool dimensions = true)
+    {
+        string doc = await NewPartAsync(name);
+        await Sk.StartAsync(doc, new EntityRef { Name = "front" }, false);
+        var add = await Sk.AddAsync(doc, [new SketchEntity { Kind = "rectangle", Center = [0, 0], WidthMm = 100, HeightMm = 60 }]);
+        if (dimensions)
+        {
+            var sides = add.Entities[0].Sides!;
+            await Ed.DimensionAddAsync(doc, [new EntityRef { Name = sides["bottom"] }], "linear", valueMm: 100);
+            await Ed.DimensionAddAsync(doc, [new EntityRef { Name = sides["left"] }], "vertical", valueMm: 60);
+        }
+        var r = await Fs.ExtrudeAsync(new ExtrudeRequest { Doc = doc, DepthMm = 20 });
+        Assert.Equal(120000, r.Verified.VolumeDeltaMm3, 1e-3);
+        if (hole)
+        {
+            await Sk.StartAsync(doc, new EntityRef { Name = "front" }, false);
+            await Sk.AddAsync(doc, [new SketchEntity { Kind = "circle", Center = [0, 0], DiameterMm = 20 }]);
+            var cut = await Fs.ExtrudeAsync(new ExtrudeRequest { Doc = doc, Cut = true, End = "through_all" });
+            Assert.Equal(-Math.PI * 100 * 20, cut.Verified.VolumeDeltaMm3, 2e-2);
+        }
+        var saved = await Docs.SaveAsync(doc, "as", Path.Combine(_dir, name + ".sldprt"), false);
+        Assert.True(File.Exists(saved.SavedTo), $"{saved.SavedTo} was not written");
+        return (doc, saved.SavedTo!);
+    }
+
+    /// <summary>A new owned drawing (closed with discard after the test, before the parts).</summary>
+    private async Task<string> DrawingAsync(string name)
+    {
+        var r = await Docs.NewAsync("drawing", "mmgs", null, $"{name}_{Guid.NewGuid().ToString("N")[..6]}");
+        _drawings.Add(r.Document.Handle);
+        Assert.Equal("drawing", r.Document.Type);
+        return r.Document.Handle;
+    }
+
+    /// <summary>A drawing of the block with the given standard views (default scale).</summary>
+    private async Task<(string Drawing, DrwViewsResult Views)> ViewsAsync(string name, string[] views, bool hole = false, bool dimensions = true)
+    {
+        var (_, path) = await BlockAsync(name, hole, dimensions);
+        string drw = await DrawingAsync(name);
+        var r = await Drw.ViewsStandardAsync(path, views, null, drw);
+        Assert.Equal(views.Length, r.Views.Count);
+        return (drw, r);
+    }
+
+    private static double ScaleOf(string scale)
+    {
+        var p = scale.Split(':');
+        return double.Parse(p[0], CultureInfo.InvariantCulture) / double.Parse(p[1], CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>The model box of a view on the sheet is exactly the block's projection at the view scale.</summary>
+    private static void AssertBoxSize(DrwView v, double w, double h)
+    {
+        double s = ScaleOf(v.Scale);
+        var b = v.ModelBoxMm!;
+        Assert.Equal(w * s, b[2] - b[0], L);
+        Assert.Equal(h * s, b[3] - b[1], L);
+    }
+
+    private static bool Overlap(double[] a, double[] b) => a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+
+    private async Task<int> ViewCountAsync(string drw) => (await Drw.InfoAsync(drw)).ViewCount;
+
+    private static async Task<SwException> Fails(string code, Func<Task> call)
+    {
+        var ex = await Assert.ThrowsAsync<SwException>(call);
+        Assert.True(ex.Code == code, $"expected {code}, got {ex.ToAgentText()}");
+        return ex;
+    }
+
+    // ------------------------------------------------------------------ doc_new type=drawing, drw_sheet_setup
+
+    [Fact]
+    public async Task New_drawing_is_A3_landscape_iso_first_angle_in_mm()
+    {
+        var r = await Docs.NewAsync("drawing", "mmgs", null, $"drw_new_{Guid.NewGuid().ToString("N")[..6]}");
+        _drawings.Add(r.Document.Handle);
+        Assert.Equal("drawing", r.Document.Type);
+        Assert.Equal("MMGS", r.Document.Units);
+        Assert.Contains("A3", r.Message);
+        var info = await Drw.InfoAsync(r.Document.Handle);
+        var s = Assert.Single(info.Sheets);
+        Assert.Equal("a3", s.Size);
+        Assert.Equal(420, s.WidthMm, 0.5);
+        Assert.Equal(297, s.HeightMm, 0.5);
+        Assert.Equal("landscape", s.Orientation);
+        Assert.Equal("first_angle", s.Projection);
+        Assert.Equal("1:1", s.Scale);
+        Assert.Equal("a3 - iso.slddrt", s.Format, ignoreCase: true);
+        Assert.Empty(s.Views!);
+    }
+
+    [Fact]
+    public async Task Sheet_setup_changes_what_is_given_and_keeps_the_rest()
+    {
+        string drw = await DrawingAsync("drw_sheet");
+        var a4 = await Drw.SheetSetupAsync(new DrwSheetRequest { Doc = drw, Size = "a4", Orientation = "portrait", Scale = "1:2" });
+        Assert.Equal("a4", a4.Sheet.Size);
+        Assert.Equal(210, a4.Sheet.WidthMm, 0.5);
+        Assert.Equal(297, a4.Sheet.HeightMm, 0.5);
+        Assert.Equal("portrait", a4.Sheet.Orientation);
+        Assert.Equal("1:2", a4.Sheet.Scale);
+        Assert.Equal("first_angle", a4.Sheet.Projection);               // kept
+        Assert.Equal("a4 - iso.slddrt", a4.Sheet.Format, ignoreCase: true); // the ISO family, now for A4
+
+        var ansi = await Drw.SheetSetupAsync(new DrwSheetRequest { Doc = drw, Format = "ansi" });
+        Assert.Equal("third_angle", ansi.Sheet.Projection);             // the ANSI family's projection
+        Assert.Equal("a4 - portrait.slddrt", ansi.Sheet.Format, ignoreCase: true);
+        Assert.Equal("1:2", ansi.Sheet.Scale);                          // kept
+
+        var user = await Drw.SheetSetupAsync(new DrwSheetRequest { Doc = drw, Size = "user", WidthMm = 500, HeightMm = 300, Format = "none" });
+        Assert.Equal("user", user.Sheet.Size);
+        Assert.Equal(500, user.Sheet.WidthMm, 0.5);
+        Assert.Equal(300, user.Sheet.HeightMm, 0.5);
+        Assert.Null(user.Sheet.Format);
+        var info = await Drw.InfoAsync(drw);
+        Assert.Equal(500, info.Sheets[0].WidthMm, 0.5);
+        Assert.Equal("third_angle", info.Sheets[0].Projection);
+    }
+
+    [Fact]
+    public async Task Sheet_setup_rejects_bad_settings_and_parts()
+    {
+        string drw = await DrawingAsync("drw_sheet_bad");
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.SheetSetupAsync(new DrwSheetRequest { Doc = drw, Size = "a3", Orientation = "portrait" }));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.SheetSetupAsync(new DrwSheetRequest { Doc = drw, Size = "a7" }));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.SheetSetupAsync(new DrwSheetRequest { Doc = drw, Scale = "big" }));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.SheetSetupAsync(new DrwSheetRequest { Doc = drw, Format = "din" }));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.SheetSetupAsync(new DrwSheetRequest { Doc = drw, Projection = "second_angle" }));
+        await Fails(ErrorCodes.IoError, () => Drw.SheetSetupAsync(new DrwSheetRequest { Doc = drw, Format = Path.Combine(_dir, "missing.slddrt") }));
+        var s = (await Drw.InfoAsync(drw)).Sheets[0]; // untouched
+        Assert.Equal("a3", s.Size);
+        Assert.Equal("1:1", s.Scale);
+
+        string part = await NewPartAsync("drw_sheet_part");
+        await Fails(ErrorCodes.WrongDocType, () => Drw.SheetSetupAsync(new DrwSheetRequest { Doc = part, Size = "a4" }));
+        await Fails(ErrorCodes.WrongDocType, () => Drw.InfoAsync(part));
+        await Fails(ErrorCodes.WrongDocType, () => Drw.NoteAddAsync("x", [10, 10], null, null, part));
+    }
+
+    // ------------------------------------------------------------------ drw_views_standard (+ PDF export)
+
+    [Fact]
+    public async Task Standard_views_have_the_block_proportions_without_overlaps_and_export_to_pdf()
+    {
+        var (_, path) = await BlockAsync("drw_views");
+        string drw = await DrawingAsync("drw_views");
+        var r = await Drw.ViewsStandardAsync(path, null, null, drw); // front, top, right, iso
+        Assert.Equal(4, r.Views.Count);
+        Assert.Equal(path, r.Model, ignoreCase: true);
+        var front = Assert.Single(r.Views, v => v.Orientation == "front");
+        var top = Assert.Single(r.Views, v => v.Orientation == "top");
+        var right = Assert.Single(r.Views, v => v.Orientation == "right");
+        Assert.Single(r.Views, v => v.Orientation == "iso");
+        AssertBoxSize(front, 100, 60);
+        AssertBoxSize(top, 100, 20);
+        AssertBoxSize(right, 20, 60);
+
+        // The front view's outline holds its model box; SOLIDWORKS may add a margin, so its proportions are 100:60 up to that.
+        var fb = front.BoundsMm!;
+        var mb = front.ModelBoxMm!;
+        Assert.True(fb[0] <= mb[0] + L && fb[1] <= mb[1] + L && fb[2] >= mb[2] - L && fb[3] >= mb[3] - L,
+            $"outline [{string.Join(", ", fb)}] does not hold the model box [{string.Join(", ", mb)}]");
+        double ratio = (fb[2] - fb[0]) / (fb[3] - fb[1]);
+        Assert.InRange(ratio, 100.0 / 60 * 0.9, 100.0 / 60 * 1.1);
+
+        // First angle (the new sheet's projection): the top view below the front view, the right view on its left.
+        Assert.True(top.CenterMm![1] < front.CenterMm![1], "the top view is not below the front view");
+        Assert.True(right.CenterMm![0] < front.CenterMm![0], "the right view is not left of the front view");
+        Assert.Equal(front.CenterMm[0], top.CenterMm[0], 0.5);
+        Assert.Equal(front.CenterMm[1], right.CenterMm[1], 0.5);
+
+        // No two views overlap, and all are on the sheet.
+        for (int i = 0; i < r.Views.Count; i++)
+        {
+            var b = r.Views[i].BoundsMm!;
+            Assert.True(b[0] >= 0 && b[1] >= 0 && b[2] <= 420 && b[3] <= 297, $"{r.Views[i].Name} leaves the sheet");
+            for (int j = i + 1; j < r.Views.Count; j++)
+                Assert.False(Overlap(b, r.Views[j].BoundsMm!), $"{r.Views[i].Name} overlaps {r.Views[j].Name}");
+        }
+
+        // drw_info lists every view created, with its model.
+        var info = await Drw.InfoAsync(drw);
+        Assert.Equal(r.Views.Select(v => v.Name).OrderBy(n => n), info.Sheets[0].Views!.Select(v => v.Name).OrderBy(n => n));
+        Assert.All(info.Sheets[0].Views!, v => Assert.Equal(path, v.Model, ignoreCase: true));
+
+        // The drawing exports to PDF through model_export.
+        var pdf = await new ExportService(S).ExportAsync(new ExportRequest { Doc = drw, Path = Path.Combine(_dir, "views.pdf") });
+        Assert.Equal("pdf", pdf.Format);
+        Assert.Equal("PDF", pdf.Details.Header);
+        Assert.True(new FileInfo(pdf.Path).Length > 1000);
+    }
+
+    [Fact]
+    public async Task Standard_views_at_a_given_scale_set_the_empty_sheets_scale()
+    {
+        var (_, path) = await BlockAsync("drw_scale");
+        string drw = await DrawingAsync("drw_scale");
+        var r = await Drw.ViewsStandardAsync(path, ["front", "top", "right"], "1:2", drw);
+        Assert.Equal("1:2", r.Scale);
+        Assert.All(r.Views, v => Assert.Equal("1:2", v.Scale));
+        AssertBoxSize(r.Views.Single(v => v.Orientation == "front"), 100, 60);
+        Assert.Equal("1:2", (await Drw.InfoAsync(drw)).Sheets[0].Scale);
+    }
+
+    [Fact]
+    public async Task Standard_views_refuse_unsaved_models_bad_names_and_drawings()
+    {
+        string unsaved = await NewPartAsync("drw_unsaved");
+        string drw = await DrawingAsync("drw_views_bad");
+        var ex = await Fails(ErrorCodes.InvalidArgument, () => Drw.ViewsStandardAsync(unsaved, null, null, drw));
+        Assert.Contains("saved", ex.Message);
+        await Fails(ErrorCodes.IoError, () => Drw.ViewsStandardAsync(Path.Combine(_dir, "missing.sldprt"), null, null, drw));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.ViewsStandardAsync(Path.Combine(_dir, "x.sldprt"), ["front", "diagonal"], null, drw));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.ViewsStandardAsync(Path.Combine(_dir, "x.sldprt"), null, "huge", drw));
+        await Fails(ErrorCodes.WrongDocType, () => Drw.ViewsStandardAsync(drw, null, null, drw));
+        Assert.Equal(0, await ViewCountAsync(drw));
+    }
+
+    // ------------------------------------------------------------------ drw_view_projected
+
+    [Fact]
+    public async Task Projected_views_follow_first_angle_projection()
+    {
+        var (drw, r) = await ViewsAsync("drw_proj", ["front"]);
+        var front = r.Views[0];
+        var left = await Drw.ProjectedAsync(front.Name, "left", drw);
+        Assert.Equal("projected", left.View.Type);
+        Assert.Equal(front.Name, left.View.Parent);
+        Assert.Equal("right", left.View.Orientation); // first angle: the view on the left shows the right side
+        Assert.True(left.View.CenterMm![0] < front.BoundsMm![0], "the projected view is not left of the front view");
+        AssertBoxSize(left.View, 20, 60);
+        var up = await Drw.ProjectedAsync(front.Name, "up", drw);
+        Assert.Equal("bottom", up.View.Orientation);  // first angle: the view above shows the bottom
+        Assert.True(up.View.CenterMm![1] > front.BoundsMm![3], "the projected view is not above the front view");
+        AssertBoxSize(up.View, 100, 20);
+        Assert.Equal(3, await ViewCountAsync(drw));
+    }
+
+    [Fact]
+    public async Task Projected_view_rejects_bad_directions_and_parents()
+    {
+        var (drw, r) = await ViewsAsync("drw_proj_bad", ["front"]);
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.ProjectedAsync(r.Views[0].Name, "diagonal", drw));
+        await Fails(ErrorCodes.EntityNotFound, () => Drw.ProjectedAsync("No Such View", "left", drw));
+        Assert.Equal(1, await ViewCountAsync(drw));
+    }
+
+    // ------------------------------------------------------------------ drw_view_section
+
+    [Fact]
+    public async Task Section_through_the_middle_is_a_hatched_section_view()
+    {
+        var (drw, r) = await ViewsAsync("drw_section", ["front"]);
+        var front = r.Views[0];
+        var b = front.ModelBoxMm!;
+        double cx = (b[0] + b[2]) / 2;
+        var sec = await Drw.SectionAsync(front.Name, [cx, b[1] - 10], [cx, b[3] + 10], null, null, drw);
+        Assert.Equal("section", sec.View.Type);
+        Assert.Equal("A", sec.Label);
+        Assert.Contains("A", sec.View.Name);
+        Assert.Equal(front.Name, sec.View.Parent);
+        // A vertical cut in the front view lies in the model's YZ plane: the section looks along ±X and shows 20 (z) x 60 (y).
+        Assert.True(sec.View.Orientation is "right" or "left", $"the section looks {sec.View.Orientation ?? "along another direction"}");
+        AssertBoxSize(sec.View, 20, 60);
+        // No hatch assertion: SOLIDWORKS' face/solid hatch counts read 0 for this hatched section (verified live).
+        var info = await Drw.InfoAsync(drw);
+        Assert.Contains(info.Sheets[0].Views!, v => v.Name == sec.View.Name && v.Type == "section");
+    }
+
+    [Fact]
+    public async Task Section_lines_that_do_not_cross_the_part_are_refused()
+    {
+        var (drw, r) = await ViewsAsync("drw_section_bad", ["front"]);
+        var front = r.Views[0];
+        var b = front.ModelBoxMm!;
+        double cx = (b[0] + b[2]) / 2, cy = (b[1] + b[3]) / 2;
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.SectionAsync(front.Name, [cx, b[1] - 10], [cx, cy], null, null, drw)); // ends inside
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.SectionAsync(front.Name, [b[2] + 5, b[1] - 10], [b[2] + 5, b[3] + 10], null, null, drw)); // misses
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.SectionAsync(front.Name, [cx, cy], [cx, cy + 0.5], null, null, drw)); // too short
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.SectionAsync(front.Name, [cx, b[1] - 10], [cx, b[3] + 10], "A1", null, drw)); // bad label
+        Assert.Equal(1, await ViewCountAsync(drw));
+    }
+
+    // ------------------------------------------------------------------ drw_view_detail
+
+    [Fact]
+    public async Task Detail_of_a_corner_has_the_requested_scale()
+    {
+        var (drw, r) = await ViewsAsync("drw_detail", ["front"]);
+        var front = r.Views[0];
+        var b = front.ModelBoxMm!;
+        var det = await Drw.DetailAsync(front.Name, [b[2] - 5, b[3] - 5], 10, "2:1", null, null, drw);
+        Assert.Equal("detail", det.View.Type);
+        Assert.Equal("2:1", det.View.Scale);
+        Assert.Equal("A", det.Label);
+        Assert.Equal(front.Name, det.View.Parent);
+        // Detail views looked empty in earlier testing: the result says whether SOLIDWORKS reports visible edges in it.
+        Assert.True(det.Checks!.Any(c => c.Contains("visible edge")) || (det.Warnings ?? []).Any(w => w.Contains("no visible edges")),
+            "the detail view result says nothing about its content");
+        Assert.Contains((await Drw.InfoAsync(drw)).Sheets[0].Views!, v => v.Name == det.View.Name && v.Type == "detail");
+    }
+
+    [Fact]
+    public async Task Detail_circles_off_the_part_or_out_of_range_are_refused()
+    {
+        var (drw, r) = await ViewsAsync("drw_detail_bad", ["front"]);
+        var front = r.Views[0];
+        var b = front.ModelBoxMm!;
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.DetailAsync(front.Name, [b[2] + 100, b[3] + 100], 5, null, null, null, drw));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.DetailAsync(front.Name, [b[0], b[1]], 0.1, null, null, null, drw));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.DetailAsync(front.Name, [b[0], b[1]], 10, "zoom", null, null, drw));
+        await Fails(ErrorCodes.EntityNotFound, () => Drw.DetailAsync("No Such View", [b[0], b[1]], 10, null, null, null, drw));
+        Assert.Equal(1, await ViewCountAsync(drw));
+    }
+
+    // ------------------------------------------------------------------ drw_dimensions_auto
+
+    [Fact]
+    public async Task Auto_dimensions_bring_in_the_sketch_dimensions_once()
+    {
+        var (drw, r) = await ViewsAsync("drw_auto", ["front", "top", "right"]);
+        var first = await Drw.DimensionsAutoAsync(null, drw);
+        Assert.True(first.Added >= 2, $"only {first.Added} model dimension(s) inserted (the sketch has 100 and 60)");
+        Assert.Equal(first.Added, first.Views.Sum(v => v.Added));
+        Assert.All(first.Views, v => Assert.Equal(v.After - v.Before, v.Added));
+        var front = first.Views.Single(v => v.View == r.Views.Single(x => x.Orientation == "front").Name);
+        Assert.True(front.Added >= 2, $"the front view (where 100 and 60 lie) got {front.Added}");
+        var info = await Drw.InfoAsync(drw);
+        Assert.Equal(first.Added, info.Sheets[0].Views!.Sum(v => v.Annotations!.Dimensions));
+
+        var again = await Drw.DimensionsAutoAsync(null, drw); // each model dimension appears once
+        Assert.Equal(0, again.Added);
+        Assert.NotNull(again.Hint);
+    }
+
+    [Fact]
+    public async Task Auto_dimensions_report_why_nothing_came_and_refuse_unknown_views()
+    {
+        var (drw, r) = await ViewsAsync("drw_auto_none", ["front"], dimensions: false);
+        var none = await Drw.DimensionsAutoAsync([r.Views[0].Name], drw);
+        if (none.Added == 0) Assert.NotNull(none.Hint);
+        Assert.Equal(none.Added, Assert.Single(none.Views).Added);
+        await Fails(ErrorCodes.EntityNotFound, () => Drw.DimensionsAutoAsync(["No Such View"], drw));
+    }
+
+    // ------------------------------------------------------------------ drw_dimension_add
+
+    [Fact]
+    public async Task Dimensions_on_model_edges_read_the_model_lengths()
+    {
+        var (drw, r) = await ViewsAsync("drw_dim", ["front", "top"], hole: true);
+        var front = r.Views.Single(v => v.Orientation == "front");
+        var top = r.Views.Single(v => v.Orientation == "top");
+
+        var width = await Drw.DimensionAddAsync(front.Name, new EntityRef { Type = "edge", At = [0, 30, 20] }, null, "linear", null, drw);
+        Assert.Equal(100, width.Value, 1e-6);
+        Assert.Equal("mm", width.Unit);
+        Assert.Equal(100, width.Expected!.Value, 1e-6);
+        Assert.Equal(front.Name, width.View);
+        Assert.Contains(width.Checks!, c => c.Contains("matches the geometry"));
+
+        var height = await Drw.DimensionAddAsync(front.Name, new EntityRef { Type = "edge", At = [50, 0, 20] }, null, "vertical", null, drw);
+        Assert.Equal(60, height.Value, 1e-6);
+
+        var dia = await Drw.DimensionAddAsync(front.Name, new EntityRef { Type = "edge", At = [10, 0, 20] }, null, "diameter", null, drw);
+        Assert.Equal(20, dia.Value, 1e-6);
+        var rad = await Drw.DimensionAddAsync(front.Name, new EntityRef { Type = "edge", At = [0, 10, 20] }, null, "radial", null, drw);
+        Assert.Equal(10, rad.Value, 1e-6);
+
+        // Two parallel edges in the top view: the front and back top edges are the block's depth apart.
+        var depth = await Drw.DimensionAddAsync(top.Name, new EntityRef { Type = "edge", At = [0, 30, 20] },
+            new EntityRef { Type = "edge", At = [0, 30, 0] }, "linear", null, drw);
+        Assert.Equal(20, depth.Value, 1e-6);
+        Assert.Equal(2, depth.Resolved!.Count);
+
+        var info = await Drw.InfoAsync(drw);
+        Assert.Equal(4, info.Sheets[0].Views!.Single(v => v.Name == front.Name).Annotations!.Dimensions);
+        Assert.Equal(1, info.Sheets[0].Views!.Single(v => v.Name == top.Name).Annotations!.Dimensions);
+    }
+
+    [Fact]
+    public async Task Hole_callouts_and_tolerances_on_drawing_dimensions()
+    {
+        // The block plus a Ø6 x 10 Hole Wizard drill on its front face (z = 20) at (30, 15).
+        var (doc, path) = await BlockAsync("drw_callout");
+        await new PartFeatureService(S).HoleAsync(new HoleRequest { Doc = doc, Points = [[30, 15, 20]], Type = "drill", DiameterMm = 6, End = "blind", DepthMm = 10 });
+        await Docs.SaveAsync(doc, "inPlace", null, false);
+        string drw = await DrawingAsync("drw_callout");
+        var front = (await Drw.ViewsStandardAsync(path, ["front"], null, drw)).Views.Single();
+
+        var hc = await Drw.DimensionAddAsync(front.Name, new EntityRef { Type = "edge", At = [33, 15, 20] }, null, "hole_callout", null, drw);
+        Assert.Equal("hole_callout", hc.Kind);
+        Assert.Equal(6, hc.Value, 1e-6);
+        Assert.Contains(hc.Checks!, c => c.StartsWith("a hole callout", StringComparison.Ordinal));
+        var notRound = await Assert.ThrowsAsync<SwException>(() =>
+            Drw.DimensionAddAsync(front.Name, new EntityRef { Type = "edge", At = [0, 30, 20] }, null, "hole_callout", null, drw));
+        Assert.Equal(ErrorCodes.InvalidArgument, notRound.Code);
+
+        // A drawing's own (reference) dimension takes a tolerance; a model dimension is toleranced in its part.
+        var width = await Drw.DimensionAddAsync(front.Name, new EntityRef { Type = "edge", At = [0, 30, 20] }, null, "linear", null, drw);
+        var fm = new FeatureManagementService(S);
+        var tol = Assert.Single((await fm.DimensionToleranceSetAsync(drw, [new ToleranceRequest { Name = width.Dimension, Type = "symmetric", Upper = 0.1 }])).Changes);
+        Assert.Equal(("symmetric", 0.1), (tol.Tolerance.Type, tol.Tolerance.Upper!.Value));
+        Assert.Equal([99.9, 100.1], tol.Limits!);
+        var model = await Assert.ThrowsAsync<SwException>(() => fm.DimensionToleranceSetAsync(drw, [new ToleranceRequest { Name = "D1@Sketch1", Type = "basic" }]));
+        Assert.Equal(ErrorCodes.EntityNotFound, model.Code);
+        Assert.Contains("part", model.Hint);
+    }
+
+    [Fact]
+    public async Task Dimensions_that_cannot_be_drawn_are_refused()
+    {
+        var (drw, r) = await ViewsAsync("drw_dim_bad", ["front"]);
+        string front = r.Views[0].Name;
+        var topEdge = new EntityRef { Type = "edge", At = [0, 30, 20] };
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.DimensionAddAsync(front, topEdge, null, "oblique", null, drw));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.DimensionAddAsync(front, topEdge, null, "radial", null, drw)); // a line
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.DimensionAddAsync(front, // an edge along z points at the viewer
+            new EntityRef { Type = "edge", At = [50, 30, 10] }, null, "linear", null, drw));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.DimensionAddAsync(front, topEdge, // parallel: no angle
+            new EntityRef { Type = "edge", At = [0, -30, 20] }, "angular", null, drw));
+        await Fails(ErrorCodes.EntityNotFound, () => Drw.DimensionAddAsync("No Such View", topEdge, null, "linear", null, drw));
+        await Fails(ErrorCodes.EntityNotFound, () => Drw.DimensionAddAsync(front, new EntityRef { Type = "edge", At = [500, 500, 500] }, null, "linear", null, drw));
+        Assert.Equal(0, (await Drw.InfoAsync(drw)).Sheets[0].Views![0].Annotations!.Dimensions);
+    }
+
+    // ------------------------------------------------------------------ drw_note_add
+
+    [Fact]
+    public async Task Note_reads_back_its_text_position_and_height()
+    {
+        string drw = await DrawingAsync("drw_note");
+        int before = (await Drw.InfoAsync(drw)).Sheets[0].Annotations?.Notes ?? 0;
+        var n = await Drw.NoteAddAsync("SWMCP NOTE\nsecond line", [100, 50], 5, null, drw);
+        Assert.Equal("SWMCP NOTE\nsecond line", n.Text);
+        Assert.Equal(100, n.AtMm![0], 0.01);
+        Assert.Equal(50, n.AtMm[1], 0.01);
+        Assert.Equal(5, n.HeightMm!.Value, 1e-3);
+        Assert.Null(n.View);
+        Assert.Contains("text read back", n.Checks!);
+        Assert.Contains("position read back", n.Checks!);
+        int after = (await Drw.InfoAsync(drw)).Sheets[0].Annotations?.Notes ?? 0;
+        Assert.Equal(before + 1, after);
+    }
+
+    [Fact]
+    public async Task Note_in_a_view_belongs_to_it_and_bad_notes_are_refused()
+    {
+        var (drw, r) = await ViewsAsync("drw_note_view", ["front"]);
+        var front = r.Views[0];
+        var n = await Drw.NoteAddAsync("IN VIEW", [front.CenterMm![0], front.BoundsMm![1] - 8], null, front.Name, drw);
+        Assert.Equal(front.Name, n.View);
+        Assert.DoesNotContain(n.Warnings ?? [], w => w.Contains("belongs to"));
+        Assert.Equal(1, (await Drw.InfoAsync(drw)).Sheets[0].Views!.Single(v => v.Name == front.Name).Annotations!.Notes);
+
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.NoteAddAsync(" ", [10, 10], null, null, drw));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.NoteAddAsync("x", [10], null, null, drw));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.NoteAddAsync("x", [10, 10], 0.1, null, drw));
+        await Fails(ErrorCodes.EntityNotFound, () => Drw.NoteAddAsync("x", [10, 10], null, "No Such View", drw));
+    }
+
+    // ------------------------------------------------------------------ drw_bom_add
+
+    [Fact]
+    public async Task Bom_of_a_part_lists_one_row()
+    {
+        var (drw, r) = await ViewsAsync("drw_bom", ["front"]);
+        var bom = await Drw.BomAddAsync(r.Views[0].Name, null, null, drw);
+        Assert.Equal(1, bom.Rows);
+        var row = Assert.Single(bom.Items);
+        Assert.Contains(row, cell => cell.Contains("drw_bom", StringComparison.OrdinalIgnoreCase)); // the part number is the file name
+        Assert.Contains(row, cell => cell.Trim() == "1");                                         // quantity
+        Assert.EndsWith(".sldbomtbt", bom.Template, StringComparison.OrdinalIgnoreCase);
+        Assert.True(bom.Columns.Count >= 3);
+        var info = await Drw.InfoAsync(drw);
+        Assert.True(info.Sheets[0].Annotations!.Tables + info.Sheets[0].Views!.Sum(v => v.Annotations!.Tables) >= 1);
+    }
+
+    [Fact]
+    public async Task Bom_rejects_bad_templates_and_views()
+    {
+        var (drw, r) = await ViewsAsync("drw_bom_bad", ["front"]);
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.BomAddAsync(r.Views[0].Name, null, "bom.txt", drw));
+        await Fails(ErrorCodes.IoError, () => Drw.BomAddAsync(r.Views[0].Name, null, Path.Combine(_dir, "missing.sldbomtbt"), drw));
+        await Fails(ErrorCodes.EntityNotFound, () => Drw.BomAddAsync("No Such View", null, null, drw));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.BomAddAsync(r.Views[0].Name, [1, 2, 3], null, drw));
+    }
+
+    // ------------------------------------------------------------------ drw_center_marks
+
+    [Fact]
+    public async Task Center_marks_mark_the_hole_in_the_front_view()
+    {
+        var (drw, r) = await ViewsAsync("drw_marks", ["front"], hole: true);
+        var cm = await Drw.CenterMarksAsync(null, drw);
+        var front = Assert.Single(cm.Views);
+        Assert.Equal(r.Views[0].Name, front.View);
+        Assert.True(front.Added >= 1, $"no center mark on the Ø20 hole (before {front.Before}, after {front.After})");
+        Assert.Null(cm.Hint);
+        Assert.Equal(front.After, (await Drw.InfoAsync(drw)).Sheets[0].Views![0].Annotations!.CenterMarks);
+    }
+
+    [Fact]
+    public async Task Center_marks_without_holes_add_none_and_unknown_views_are_refused()
+    {
+        var (drw, r) = await ViewsAsync("drw_marks_none", ["front"]);
+        var cm = await Drw.CenterMarksAsync([r.Views[0].Name], drw);
+        Assert.Equal(0, cm.Added);
+        Assert.NotNull(cm.Hint);
+        await Fails(ErrorCodes.EntityNotFound, () => Drw.CenterMarksAsync(["No Such View"], drw));
+    }
+
+    // ------------------------------------------------------------------ drw_annotation_add
+
+    private Task<DrwAnnotationResult> Annotate(string drw, string view, string kind, EntityRef? at, Func<DrwAnnotationRequest, DrwAnnotationRequest>? more = null)
+    {
+        var q = new DrwAnnotationRequest { Doc = drw, View = view, Kind = kind, At = at };
+        return Drw.AnnotationAddAsync(more is null ? q : more(q));
+    }
+
+    private static EntityRef Edge(double x, double y, double z) => new() { Type = "edge", At = [x, y, z] };
+
+    [Fact]
+    public async Task Datum_surface_finish_and_tolerance_frames_attach_to_model_edges_and_read_back()
+    {
+        var (drw, r) = await ViewsAsync("drw_gdt", ["front"], hole: true);
+        string front = r.Views[0].Name;
+
+        var datum = await Annotate(drw, front, "datum", Edge(0, 30, 20), q => q with { Label = "A" });
+        Assert.Equal("A", datum.Text);
+        Assert.True(datum.AttachedTo >= 1);
+        Assert.Contains(datum.Checks!, c => c.Contains("label 'A' read back", StringComparison.Ordinal));
+
+        var finish = await Annotate(drw, front, "surface_finish", Edge(50, 0, 20), q => q with { Roughness = "1.6", Finish = "machining_required" });
+        Assert.Equal("machining_required Ra 1.6", finish.Text);
+        Assert.True(finish.AttachedTo >= 1);
+
+        // Position of the Ø20 hole: Ø0.1 at MMC relative to datum A, on the hole's edge on the front face.
+        var pos = await Annotate(drw, front, "gtol", Edge(10, 0, 20),
+            q => q with { Characteristic = "position", Tolerance = "0.1", Diameter = true, Material = "mmc", Datums = ["A"] });
+        Assert.Equal("position Ø0.1 (MMC) | A", pos.Text);
+        Assert.True(pos.AttachedTo >= 1);
+
+        // Flatness of the top face's edge: a form tolerance, no datum; placed where asked.
+        var flat = await Annotate(drw, front, "gtol", Edge(0, 30, 20), q => q with { Characteristic = "flatness", Tolerance = "0.05", AtMm = [60, 250] });
+        Assert.Equal("flatness 0.05", flat.Text);
+        Assert.Equal(60, flat.AtMm![0], 1e-3);
+        Assert.Equal(250, flat.AtMm![1], 1e-3);
+    }
+
+    [Fact]
+    public async Task Balloon_on_a_part_view_with_a_bom_shows_item_1()
+    {
+        var (drw, r) = await ViewsAsync("drw_balloon", ["front"]);
+        string front = r.Views[0].Name;
+        await Drw.BomAddAsync(front, null, null, drw);
+        var b = await Annotate(drw, front, "balloon", Edge(0, 30, 20));
+        Assert.Equal("1", b.Text);
+        Assert.True(b.AttachedTo >= 1);
+    }
+
+    [Fact]
+    public async Task Balloons_for_a_whole_assembly_view_number_each_part_once()
+    {
+        var (_, a) = await BlockAsync("drw_asm_a");
+        var (_, b) = await BlockAsync("drw_asm_b", hole: true);
+        var asmSvc = new AssemblyService(S);
+        var asm = await Docs.NewAsync("assembly", "mmgs", null, $"drw_asm_{Guid.NewGuid().ToString("N")[..6]}");
+        string asmDoc = asm.Document.Handle;
+        await asmSvc.InsertAsync(new AsmInsertRequest { Doc = asmDoc, Path = a });
+        await asmSvc.InsertAsync(new AsmInsertRequest { Doc = asmDoc, Path = b, OriginMm = [150, 0, 0] });
+        var saved = await Docs.SaveAsync(asmDoc, "as", Path.Combine(_dir, "drw_asm.sldasm"), false);
+        string drw = await DrawingAsync("drw_asm");
+        _drawings.Add(asmDoc); // closed after the drawing, before the parts
+        var views = await Drw.ViewsStandardAsync(saved.SavedTo!, ["front"], null, drw);
+        string front = views.Views[0].Name;
+        await Drw.BomAddAsync(front, null, null, drw);
+        var r = await Annotate(drw, front, "balloon", null);
+        Assert.Equal(2, r.Count);
+        Assert.Equal(["1", "2"], r.Text.Split(", ").Order().ToArray());
+        Assert.Contains(r.Checks!, c => c.Contains("item numbers distinct", StringComparison.Ordinal));
+    }
+
+    // ------------------------------------------------------------------ drw_table_add
+
+    [Fact]
+    public async Task Hole_table_lists_the_hole_from_the_lower_left_corner_and_from_a_given_origin()
+    {
+        var (drw, r) = await ViewsAsync("drw_holes", ["front"], hole: true);
+        string front = r.Views[0].Name;
+        // Default: the front face (toward the viewer) and its lowest-left vertex (-50, -30): the hole is 50 right, 30 up.
+        var t = await Drw.TableAddAsync(new DrwTableRequest { Doc = drw, Kind = "hole", View = front });
+        Assert.Equal(1, t.Rows);
+        var row = Assert.Single(t.Items);
+        int cx = t.Columns.ToList().FindIndex(c => c.Contains("X", StringComparison.OrdinalIgnoreCase));
+        int cy = t.Columns.ToList().FindIndex(c => c.Contains("Y", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(50, double.Parse(row[cx], CultureInfo.InvariantCulture), 0.01);
+        Assert.Equal(30, double.Parse(row[cy], CultureInfo.InvariantCulture), 0.01);
+        Assert.Contains(t.Checks!, c => c.Contains("X/Y from the origin and size read back", StringComparison.Ordinal));
+        Assert.EndsWith(".sldholtbt", t.Template, StringComparison.OrdinalIgnoreCase);
+        // From the top-right corner (50, 30) the hole is at (-50, -30).
+        var t2 = await Drw.TableAddAsync(new DrwTableRequest
+        {
+            Doc = drw, Kind = "hole", View = front, Origin = new EntityRef { Type = "vertex", At = [50, 30, 20] }, AtMm = [30, 120],
+        });
+        var row2 = Assert.Single(t2.Items);
+        Assert.Equal(-50, double.Parse(row2[cx], CultureInfo.InvariantCulture), 0.01);
+        Assert.Equal(-30, double.Parse(row2[cy], CultureInfo.InvariantCulture), 0.01);
+    }
+
+    [Fact]
+    public async Task Revision_table_gets_rows_A_B_and_then_C()
+    {
+        var (drw, _) = await ViewsAsync("drw_revs", ["front"]);
+        var t = await Drw.TableAddAsync(new DrwTableRequest { Doc = drw, Kind = "revision", Revisions = ["First release", "Hole added"] });
+        Assert.Equal(2, t.Rows);
+        Assert.Equal("B", t.CurrentRevision);
+        int desc = t.Columns.ToList().FindIndex(c => c.Contains("DESCRIPTION", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(t.Items, row => row[desc] == "First release");
+        Assert.Contains(t.Items, row => row[desc] == "Hole added");
+        var t2 = await Drw.TableAddAsync(new DrwTableRequest { Doc = drw, Kind = "revision", Revisions = ["Material changed"] });
+        Assert.Equal(3, t2.Rows);
+        Assert.Equal("C", t2.CurrentRevision);
+        Assert.Contains(t2.Checks!, c => c.Contains("added to the sheet's revision table", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Tables_that_cant_work_are_refused()
+    {
+        var (drw, r) = await ViewsAsync("drw_tables_bad", ["front"]);
+        string front = r.Views[0].Name;
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.TableAddAsync(new DrwTableRequest { Doc = drw, Kind = "weld" }));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.TableAddAsync(new DrwTableRequest { Doc = drw, Kind = "hole" }));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.TableAddAsync(new DrwTableRequest { Doc = drw, Kind = "revision" }));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.TableAddAsync(new DrwTableRequest { Doc = drw, Kind = "revision", Revisions = [" "] }));
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.TableAddAsync(new DrwTableRequest { Doc = drw, Kind = "hole", View = front, Template = "x.sldbomtbt" }));
+        // The block without a hole: nothing to list.
+        await Fails(ErrorCodes.InvalidArgument, () => Drw.TableAddAsync(new DrwTableRequest { Doc = drw, Kind = "hole", View = front }));
+        Assert.Equal(0, (await Drw.InfoAsync(drw)).Sheets[0].Views!.Sum(v => v.Annotations!.Tables));
+    }
+
+    [Fact]
+    public async Task Annotations_that_cant_work_are_refused()
+    {
+        var (drw, r) = await ViewsAsync("drw_gdt_bad", ["front"]);
+        string front = r.Views[0].Name;
+        var edge = Edge(0, 30, 20);
+        await Fails(ErrorCodes.InvalidArgument, () => Annotate(drw, front, "weld", edge));
+        await Fails(ErrorCodes.InvalidArgument, () => Annotate(drw, front, "datum", null));
+        await Fails(ErrorCodes.InvalidArgument, () => Annotate(drw, front, "datum", edge, q => q with { Label = "I" }));
+        await Fails(ErrorCodes.InvalidArgument, () => Annotate(drw, front, "datum", edge, q => q with { Roughness = "1.6" }));
+        await Fails(ErrorCodes.InvalidArgument, () => Annotate(drw, front, "gtol", edge, q => q with { Characteristic = "perpendicularity", Tolerance = "0.1" }));
+        await Fails(ErrorCodes.InvalidArgument, () => Annotate(drw, front, "gtol", edge, q => q with { Characteristic = "flatness", Tolerance = "0.1", Datums = ["A"] }));
+        await Fails(ErrorCodes.InvalidArgument, () => Annotate(drw, front, "gtol", edge, q => q with { Characteristic = "flatness", Tolerance = "-1" }));
+        await Fails(ErrorCodes.InvalidArgument, () => Annotate(drw, front, "gtol", edge, q => q with { Characteristic = "wobble", Tolerance = "0.1" }));
+        await Fails(ErrorCodes.EntityNotFound, () => Annotate(drw, "No Such View", "datum", edge));
+    }
+}

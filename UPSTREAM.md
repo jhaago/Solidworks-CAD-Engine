@@ -1,23 +1,41 @@
 # Upstream baseline
 
 Source: https://github.com/soheil-mp/solidworks-mcp
-Pinned commit: `f450dabcd02a9a7ba705ee9e18a77aaeee9fe802` (27 October 2026).
-Licence: MIT; original LICENSE and THIRD-PARTY-NOTICES.md retained without modification.
+Pinned commit: `05f368266e64ba0a570f8a9147b6aa7b701bb380` (31 October 2026).
+Licence: MIT. Original LICENSE and THIRD-PARTY-NOTICES.md are unchanged.
 
-The target was verified empty on 31 October 2026. Anonymous Git clone retained all 70 upstream commits locally, but Git push has no credentials. The authenticated connector cannot seed an empty repository from a foreign commit. Therefore this repository imports the complete 182-file pinned source snapshot; no proprietary SOLIDWORKS binaries are included.
+## Import audit
 
-For future upstream updates:
+At session start this repository was **not empty**: main was
+`c53ce56756c1d80387ae7c1e8fe70219f3435cb2`, containing only UPSTREAM.md.
+Its claim that 182 source files had already been imported was incorrect.
+This commit imports all 185 tracked files from the pin above, including all
+service families, MCP hosting, tests, tools, build configuration and CI.
+No proprietary SOLIDWORKS assemblies, CAD documents or secrets are included.
+
+Anonymous clone/fetch retained upstream history locally, but direct Git push
+has no credentials in this environment. The authenticated GitHub connector
+imports a complete pinned snapshot while preserving this repository's main
+history. The upstream commit and tree can be checked with git fetch.
+
+## Updates
 
 ```powershell
 git remote add upstream https://github.com/soheil-mp/solidworks-mcp.git
 git fetch upstream
-# Initial snapshot import only: connect the recorded upstream ancestry.
 git switch -c maintenance/upstream-ancestry
-git merge --strategy=ours --allow-unrelated-histories f450dabcd02a9a7ba705ee9e18a77aaeee9fe802
-# Review this ancestry-only commit in a PR before normal upstream merges.
-# Thereafter: git switch -c maintenance/upstream-update; git merge upstream/main
+# Review the snapshot against this exact source before linking ancestry:
+git diff 05f368266e64ba0a570f8a9147b6aa7b701bb380 -- . ':!UPSTREAM.md'
+# Connect the imported baseline, never upstream/main at an unknown newer SHA:
+git merge -s ours --allow-unrelated-histories 05f368266e64ba0a570f8a9147b6aa7b701bb380
+# Submit ancestry-only PR; do not merge custom development without approval.
+# After it is reviewed/merged, use ordinary upstream merge PRs.
+git switch -c maintenance/upstream-update
+git merge upstream/main
 ```
 
-Review upstream source/licence/build changes and tests in an update PR. Resolve conflicts in integration files deliberately. Never replace this repository or force-push to add fork metadata. The baseline tree is pinned; custom development remains on integration branches.
-
-See `docs/INTEGRATION.md` on the adapter PR for build, start, acceptance, evidence and rollout details.
+Review licence, dependency, API and script changes on every update. Keep
+integration changes separate. Do not recreate this repository or force-push.
+Project B (`czuryk/SolidworksMCP`, MIT, inspected at
+`eccb8af4aa76416baf2a5ca99b256da19b73d9b6`) is a secondary source only;
+no second engine or heavyweight reconstruction dependencies are imported.
