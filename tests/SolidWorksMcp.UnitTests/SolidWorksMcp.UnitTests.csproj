@@ -61,4 +61,5 @@
     <Compile Include="..\..\src\SolidWorksMcp.Core\Services\DimensionTolerance.cs" Link="Core\Services\DimensionTolerance.cs" />
   </ItemGroup>
 
+  <ItemGroup><Compile Include="../../src/SolidWorksMcp.Core/Services/DimensionNamePolicy.cs" Link="Core/Services/DimensionNamePolicy.cs" /></ItemGroup>
 </Project>

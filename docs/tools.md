@@ -1542,3 +1542,9 @@ Runs SolidWorks BASIC code (VBA-like) inside SOLIDWORKS — a last resort when n
 | `timeoutS` | integer |  | Time limit in seconds (5-600). Default: `50`. |
 | `doc` | string |  | Document (handle, title or path) bound to swDoc; default: the target document. |
 
+
+## Local integration extension (native verification pending)
+
+### `dimension_rename` — Rename driving dimension
+
+Parameters: `name` (existing qualified dimension name), `newName` (unqualified letter/digit/underscore name, maximum 64 characters), optional `doc`. Returns `previousName` and dimension readback. Uses upstream ownership and STA services. This addition has offline naming-policy tests and an unexecuted native test; it has not passed the upstream live catalog verification in this environment.
