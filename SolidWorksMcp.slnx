@@ -3,7 +3,10 @@
     <Project Path="src/SolidWorksMcp.Core/SolidWorksMcp.Core.csproj" />
     <Project Path="src/SolidWorksMcp.Server/SolidWorksMcp.Server.csproj" />
   </Folder>
+  <Folder Name="/adapters/"><Project Path="adapters/SolidWorksCadEngine.Adapter/SolidWorksCadEngine.Adapter.csproj" /></Folder>
+  <Folder Name="/tools/"><Project Path="tools/CadEngine.Acceptance/CadEngine.Acceptance.csproj" /></Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/SolidWorksCadEngine.AdapterTests/SolidWorksCadEngine.AdapterTests.csproj" />
     <Project Path="tests/SolidWorksMcp.UnitTests/SolidWorksMcp.UnitTests.csproj" />
     <Project Path="tests/SolidWorksMcp.LiveTests/SolidWorksMcp.LiveTests.csproj" />
   </Folder>

@@ -1,0 +1,21 @@
+name: adapter
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  protocol:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Build reusable .NET Standard adapter
+        run: dotnet build adapters/SolidWorksCadEngine.Adapter -c Release
+      - name: Subprocess protocol and failure tests
+        run: dotnet run --project tests/SolidWorksCadEngine.AdapterTests -c Release
+      - name: Compile Windows acceptance runner (does not run native CAD)
+        run: dotnet build tools/CadEngine.Acceptance -c Release

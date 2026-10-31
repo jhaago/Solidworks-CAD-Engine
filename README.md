@@ -1,3 +1,9 @@
+# SolidWorks CAD Engine
+
+Complete upstream-based foundation with an opt-in shared MCP adapter. See
+[provenance](UPSTREAM.md), [build, integration and Windows acceptance](docs/INTEGRATION.md),
+and [actual test evidence](docs/TEST-RESULTS.md). The upstream README follows.
+
 
 [![M8ven Score](https://m8ven.ai/badge/mcp/soheil-mp-solidworks-mcp-1iko97)](https://m8ven.ai/mcp/soheil-mp-solidworks-mcp-1iko97?s=readme)
 
