@@ -223,10 +223,18 @@ namespace SolidWorksCadEngine.Adapter
             if (result["isError"]?.Value<bool>() != true) return false;
             var text = string.Join("\n", (result["content"] as JArray ?? new JArray())
                 .Where(b => (string)b["type"] == "text").Select(b => (string)b["text"]));
-            return text.StartsWith("TIMEOUT:", StringComparison.Ordinal) ||
-                text.StartsWith("CANCELLED:", StringComparison.Ordinal) ||
-                text.StartsWith("CANCELED:", StringComparison.Ordinal) ||
-                text.StartsWith("UNKNOWN_OUTCOME:", StringComparison.Ordinal);
+            // Upstream INTERNAL may be thrown while serializing a successful native mutation; a dialog can
+            // also outlive the response. Only explicit pre-execution rejections establish a safe failure.
+            string code = text.Split(':')[0].Trim();
+            switch (code)
+            {
+                case "INVALID_ARGUMENT": case "ENTITY_NOT_FOUND": case "ENTITY_AMBIGUOUS":
+                case "WRONG_DOC_TYPE": case "NO_ACTIVE_DOC": case "SKETCH_STATE":
+                case "NOT_SUPPORTED": case "ADDIN_UNAVAILABLE": case "DISABLED":
+                case "NOT_OWNED": case "DIRTY": case "BUSY": case "USER_BUSY":
+                    return false;
+                default: return true;
+            }
         }
 
         private async Task<JObject> ExchangeAsync(JObject request, Task<JObject> response)

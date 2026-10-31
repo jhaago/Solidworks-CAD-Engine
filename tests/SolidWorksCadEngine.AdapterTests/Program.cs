@@ -70,12 +70,14 @@ internal static class Program
                 using var s=await McpBackendSession.StartAsync(Options(),Boundary(Fresh()));
                 await Throws<UncertainOutcomeException>(()=>s.CallToolAsync("model_change",new JObject{{"mode","exit"}}));
             }),
-            ("server TIMEOUT is uncertain despite response", async () => {
+            ("ambiguous server errors are uncertain despite response", async () => {
+                foreach (var mode in new[]{"server-timeout","server-internal","server-dialog"}) {
                 var root=Fresh();using var s=await McpBackendSession.StartAsync(Options(),Boundary(root));
-                var r=await s.CallToolAsync("model_change",new JObject{{"mode","server-timeout"}});
+                var r=await s.CallToolAsync("model_change",new JObject{{"mode",mode}});
                 Check(r["isError"]?.Value<bool>()==true,"error lost");
                 await Throws<UncertainOutcomeException>(()=>s.CallToolAsync("sw_status",new JObject()));
-                Check(File.Exists(Path.Combine(root,"cad.lock.recovery-required")),"server timeout marker cleared");
+                Check(File.Exists(Path.Combine(root,"cad.lock.recovery-required")),"ambiguous server error marker cleared");
+                }
             }),
             ("protocol mismatch rejected", async () => { await Throws<InvalidDataException>(()=>McpBackendSession.StartAsync(Options("bad-protocol"),Boundary(Fresh()))); }),
             ("repeated discovery cursor rejected", async () => { await Throws<InvalidDataException>(()=>McpBackendSession.StartAsync(Options("bad-cursor"),Boundary(Fresh()))); }),
@@ -160,8 +162,8 @@ internal static class Program
                 if(behavior=="slow")await Task.Delay(300);
                 if(behavior=="malformed"){Console.WriteLine("not json");await Console.Out.FlushAsync();continue;}
                 if(behavior=="rpc-error") {Console.WriteLine(new JObject{{"jsonrpc","2.0"},{"id",id},{"error",new JObject{{"code",-32001},{"message","worker failed"},{"data",new JObject{{"detail","retained"}}}}}}.ToString(Newtonsoft.Json.Formatting.None));continue;}
-                bool error=behavior is "tool-error" or "server-timeout";
-                result=new JObject{{"isError",error},{"content",new JArray(new JObject{{"type","text"},{"text",error?(behavior=="server-timeout"?"TIMEOUT: may finish":"INVALID_ARGUMENT: bad value"):"{\"ok\":true}"}},new JObject{{"type","image"},{"mimeType","image/png"},{"data","opaque"}})},
+                bool error=behavior is "tool-error" or "server-timeout" or "server-internal" or "server-dialog";
+                result=new JObject{{"isError",error},{"content",new JArray(new JObject{{"type","text"},{"text",error?(behavior=="server-timeout"?"TIMEOUT: may finish":behavior=="server-internal"?"INTERNAL: result serialization failed":behavior=="server-dialog"?"DIALOG_BLOCKING: native call waiting":"INVALID_ARGUMENT: bad value"):"{\"ok\":true}"}},new JObject{{"type","image"},{"mimeType","image/png"},{"data","opaque"}})},
                     {"structuredContent",new JObject{{"feature","Plate"},{"vba",Environment.GetEnvironmentVariable("SWMCP_VBA")}}},{"_meta",new JObject{{"opaque",42}}}};
                 if(behavior=="empty-result")result=new JObject();
                 if(behavior=="bad-content")result["content"]=new JObject();

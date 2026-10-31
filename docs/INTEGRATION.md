@@ -138,8 +138,10 @@ follows a failure or uncertain outcome.
   Journal files contain local CAD data and should stay within the job workspace.
 - Cancellation while queued sends no operation. Cancellation after dispatch,
   client timeout, malformed output, EOF/worker loss, RPC errors and tool-level
-  TIMEOUT/CANCELLED/UNKNOWN_OUTCOME poison the session. Normal tool `isError`
-  results are preserved; callers abort their approved sequence on errors.
+  ambiguous tool errors (including TIMEOUT, INTERNAL and DIALOG_BLOCKING)
+  poison the session. Only explicit validation/policy rejections are treated
+  as known failures. All tool `isError` results are preserved; callers abort
+  their approved sequence on errors.
 - No request retry, reconnect, backend fallback or replay is implemented.
   Killing the engine does not prove an external COM operation stopped in
   SOLIDWORKS. Marker persistence blocks both updated backends after a crash.

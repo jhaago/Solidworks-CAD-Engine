@@ -83,7 +83,11 @@ acceptance contract against the upstream source. Two substantive issues were
 fixed with regression tests: confirmed worker termination/request drain before
 lease release, and fail-closed validation of tool-result envelopes before
 clearing intent. The received uncertain response is now also retained in the
-local journal. No second independent review was performed after these fixes;
+local journal. A final source audit also reproduced a server INTERNAL error incorrectly
+clearing intent (17/18), then verified conservative quarantine for INTERNAL,
+DIALOG_BLOCKING and other ambiguous tool errors. Only explicit pre-execution
+validation/policy refusals are considered known failures.
+No second independent review was performed after these fixes;
 the full adapter and app boundary suites were rerun.
 
 Deferred native testing: dimension-name collision and rename rollback cases
@@ -96,3 +100,9 @@ CI definitions are supplied for both platforms' adapter suite and the app's
 pinned shared-boundary build. CI results must be read from their runs; local
 results above are not claims that remote CI passed. No software is deployed
 and custom integration PRs remain unmerged.
+
+Remote CI on initial implementation e7405f1 passed the adapter workflow on
+Linux and Windows and the retained upstream Windows offline suite. The
+application boundary workflow and original portable policy tests passed on
+361633a; its larger Windows workflow was still running at that observation.
+These are revision-specific results, not proof of native SOLIDWORKS execution.
